@@ -1,27 +1,76 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 if TYPE_CHECKING:
-    from narwhals.typing import IntoFrame
+    from pfeed.io.base_io import BaseIO, Partition
+    from pfeed.streaming.sink import Sink
 
-    from pfeed.io.database_io import DBPath
-    from pfeed.io.file_io import FileIO
-    from pfeed.sinks.base_sink import BaseSink
-    from pfeed.sources.pfund.component_data_model import PFundComponentDataModel
+    from pfeed_pfund.component.data_model import PFundComponentDataModel
+
+import datetime
 
 import polars as pl
-
-from pfeed.base.data_handler import BaseDataHandler
-from pfeed.enums import DataLayer, DataTool, IOType
-from pfeed.io.table_io import TablePath
-from pfeed.sources.pfund.component_metadata import PFundComponentDataMetadata
-from pfeed.utils.file_path import FilePath
+from pfeed.base.data_handler import BaseDataHandler, BaseDataMetadata
+from pfeed.enums import DataCategory, DataLayer
+from pfeed.io.base_io import DatasetKey
 from pfund.enums import ArtifactType, ComponentType
 from pfund_blocks.enums.env import Environment
+from pydantic import BaseModel, Field
 
 
-class PFundComponentDataHandler(BaseDataHandler):
+# FIXME: restructure it in pfeed-pfund
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.UTC)
+
+
+class ComponentMetadata(BaseModel):
+    """A persisted snapshot of a pfund component's definition."""
+
+    class_name: str
+    source_sha256: str
+    component_name: str
+    resolution: str
+    df_form: Literal["wide", "long"]
+    signal_cols: list[str] = Field(default_factory=list)
+    model: str | None = None
+    signature: tuple[tuple[Any, ...], dict[str, Any]]
+    config: dict[str, Any]
+    params: dict[str, Any]
+    datas: list[dict[str, Any]]
+    strategies: list[str] = Field(default_factory=list)
+    models: list[str] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)
+
+
+class RunMetadata(BaseModel):
+    """The run context in which the component snapshot was produced."""
+
+    env: str
+    project_name: str
+    run_name: str
+    run_mode: str
+    data_start: datetime.date
+    data_end: datetime.date
+    settings: dict[str, Any]
+
+
+class PFundComponentDataMetadata(BaseDataMetadata):
+    """Per-partition metadata of a component artifact: the component snapshot that produced it.
+
+    The run identity (env, project, run) and the component identity (type, id) are in the DatasetKey,
+    they are repeated in the snapshot since it is the component's full definition, read back as one unit.
+    """
+
+    schema_version: Literal[1] = 1
+    created_at: datetime.datetime = Field(default_factory=_utc_now, frozen=True)
+    component_id: str
+    component_type: str
+    component: ComponentMetadata
+    run: RunMetadata
+
+
+class PFundComponentDataHandler(BaseDataHandler["PFundComponentDataModel", PFundComponentDataMetadata]):
     """Persists pfund component artifacts on file-based storage.
 
     The artifact arrives already in its owner's currency — opaque bytes for
@@ -52,81 +101,25 @@ class PFundComponentDataHandler(BaseDataHandler):
                                         checkpoint.pth or checkpoint.pkl
     """
 
-    _data_model: PFundComponentDataModel
-    Metadata: ClassVar[type[PFundComponentDataMetadata]] = PFundComponentDataMetadata
-    PARTITION_COLUMNS: ClassVar[list[str]] = ["chunk_num"]
-    IO_USING_PARTITION_COLUMNS: ClassVar[set[str]] = {"DeltaLakeIO"}
+    Metadata = PFundComponentDataMetadata
+    # pfund-owned column splitting a standalone strategy backtest's data into chunks
+    CHUNK_COL: ClassVar[str] = "chunk_num"
 
     def __init__(
         self,
-        data_path: FilePath,
-        data_layer: DataLayer,  # not in use
-        data_domain: str,  # not in use
         data_model: PFundComponentDataModel,
-        io: FileIO,
-        sink: BaseSink | None = None,
+        io: BaseIO,
+        # component data has no data layers, data_layer is not part of its DatasetKey
+        data_layer: DataLayer | str = DataLayer.CLEANED,
+        data_domain: str = DataCategory.COMPONENT_DATA,
+        sink: Sink | None = None,
     ):
-        super().__init__(
-            data_path=data_path,
-            data_layer=data_layer,
-            data_domain=data_domain,
-            data_model=data_model,
-            io=io,
-            sink=sink,
-        )
-        if self._io_type == IOType.FILE:
-            self._file_paths = [self._create_file_path()]
-        elif self._io_type == IOType.TABLE and self._table_path:
-            artifact = self._data_model
-            if artifact.artifact_type == ArtifactType.data:
-                self._table_path /= f"trading_df{artifact.extension}"
-
-    @property
-    def file_path(self) -> FilePath:
-        return self._file_paths[0]
-
-    def _create_file_path(self) -> FilePath:
-        artifact = self._data_model
-        artifact_dir = self._create_table_path()
-        match artifact.artifact_type:
-            case ArtifactType.source:
-                from pfeed.sources.pfund.component_data_model import SourceArtifact
-
-                return artifact_dir / cast(SourceArtifact, artifact).filename
-            case ArtifactType.model:
-                return artifact_dir / f"model{artifact.extension}"
-            case ArtifactType.checkpoint:
-                from pfeed.sources.pfund.component_data_model import CheckpointArtifact
-
-                return (
-                    artifact_dir
-                    / "checkpoints"
-                    / f"step={cast(CheckpointArtifact, artifact).step}"
-                    / f"checkpoint{artifact.extension}"
-                )
-            case ArtifactType.data:
-                raise ValueError("data artifacts use a table path, not a file path")
-            case _:
-                assert_never(artifact.artifact_type)
-
-    def _create_table_path(self) -> TablePath:
-        from pfund.engines.base_engine import BaseEngine
-
-        artifact = self._data_model
-        run_path = BaseEngine._create_run_path(
-            data_path=cast(FilePath, self._data_path),
-            env=Environment(artifact.env),
-            project_name=artifact.project_name,
-            run_name=artifact.run_name,
-        )
-        return TablePath(
-            run_path
-            / ComponentType[artifact.component_type].to_plural()
-            / artifact.component_id
-        )
-
-    def _create_db_path(self, *args: Any, **kwargs: Any) -> DBPath:
-        raise NotImplementedError
+        super().__init__(data_model, io, data_domain=data_domain, data_layer=data_layer, sink=sink)
+        # FIXME: BaseIO only stores frames, source/model/checkpoint artifacts are opaque bytes and need a bytes IO
+        if data_model.artifact_type != ArtifactType.data:
+            raise NotImplementedError(f'storing {data_model.artifact_type} artifacts is not supported yet, no IO stores bytes')
+        if sink is not None:
+            raise NotImplementedError('storing streamed component data is not supported yet')
 
     def _requires_partitioning(self) -> bool:
         """Partition standalone strategy backtests within one data artifact.
@@ -137,91 +130,64 @@ class PFundComponentDataHandler(BaseDataHandler):
         Model/feature data and strategy data from other environments retain
         their existing unpartitioned layout.
         """
-        artifact = self._data_model
-        return (
-            artifact.artifact_type == ArtifactType.data
-            and artifact.env == Environment.BACKTEST
-            and artifact.component_type == ComponentType.strategy
-            and super()._requires_partitioning()
+        data_model = self._data_model
+        return data_model.env == Environment.BACKTEST and data_model.component_type == ComponentType.strategy
+
+    def _create_dataset_key(self) -> DatasetKey:
+        data_model = self._data_model
+        return DatasetKey(
+            namespace={
+                'env': str(data_model.env),
+                'project_name': data_model.project_name,
+                'run_name': data_model.run_name,
+            },
+            name={
+                'component_type': str(data_model.component_type),
+                'component_id': data_model.component_id,
+                'artifact_type': str(data_model.artifact_type),
+            },
+            partition_by=(self.CHUNK_COL,) if self._requires_partitioning() else (),
         )
 
-    def _validate_partition_columns(self, df: pl.DataFrame) -> None:
-        missing_columns = [
-            column for column in self.PARTITION_COLUMNS if column not in df.columns
-        ]
-        if missing_columns:
-            raise ValueError(
-                "BACKTEST strategy data is missing required partition "
-                + f"column(s): {missing_columns}"
-            )
-
-        chunk_num = df.get_column("chunk_num")
+    def _validate_schema(self, df: pl.DataFrame) -> pl.DataFrame:
+        if not self._requires_partitioning():
+            return df
+        if self.CHUNK_COL not in df.columns:
+            raise ValueError(f"BACKTEST strategy data is missing the required partition column '{self.CHUNK_COL}'")
+        chunk_num = df.get_column(self.CHUNK_COL)
         if not chunk_num.dtype.is_integer():
-            raise TypeError(
-                "BACKTEST strategy data column 'chunk_num' must have an integer "
-                + f"dtype, got {chunk_num.dtype}"
-            )
+            raise TypeError(f"BACKTEST strategy data column '{self.CHUNK_COL}' must have an integer dtype, got {chunk_num.dtype}")
         if chunk_num.null_count() > 0:
-            raise ValueError(
-                "BACKTEST strategy data column 'chunk_num' cannot contain nulls"
-            )
-        if not chunk_num.is_empty() and cast(int, chunk_num.min()) < 0:
-            raise ValueError(
-                "BACKTEST strategy data column 'chunk_num' cannot contain negative values"
-            )
-
-    def write_batch(self, data: IntoFrame | bytes) -> None:
-        with self.io:
-            if isinstance(data, bytes):
-                # source (.py) and model weights (.safetensors / .joblib) arrive as
-                # opaque bytes pfund already serialized; FileIO writes them verbatim.
-                self.io.write(data, self.file_path)
-                if self._data_model.artifact_type == ArtifactType.source:
-                    self.io.write_metadata(
-                        self.file_path, metadata=self._create_metadata()
-                    )
-            else:  # data artifact writing to deltalake
-                from pfeed.utils.dataframe import convert_dataframe
-                from pfeed.sources.pfund.component_data_model import DataArtifact
-
-                table_path = self._table_path
-                assert table_path is not None, "table path is not initialized"
-                artifact = cast(DataArtifact, self._data_model)
-                lf = cast(pl.LazyFrame, convert_dataframe(data, DataTool.polars))
-                df = lf.collect()
-                write_kwargs: dict[str, Any] = {}
-                if self._requires_partitioning():
-                    self._validate_partition_columns(df)
-                    write_kwargs["partition_by"] = self.PARTITION_COLUMNS
-                self.io.write(
-                    df.to_arrow(),
-                    table_path,
-                    delete_where=artifact.replace_where,
-                    **write_kwargs,
-                )
-                self.io.write_metadata(table_path, metadata=self._create_metadata())
-
-    def read(self) -> pl.LazyFrame | bytes | None:
-        match self._io_type:
-            case IOType.FILE:
-                return self.io.read(file_paths=self._file_paths)
-            case IOType.TABLE:
-                table_path = self._table_path
-                assert table_path is not None, "table path is not initialized"
-                return self.io.read(table_path)
-            case IOType.DATABASE:
-                raise NotImplementedError(
-                    f"{self.__class__.__name__} does not support database IO"
-                )
-            case _:
-                assert_never(self._io_type)
-
-    # REVIEW: no validation, not in use
-    def _validate_schema(self, df: pl.LazyFrame) -> Any:
+            raise ValueError(f"BACKTEST strategy data column '{self.CHUNK_COL}' cannot contain nulls")
+        if not chunk_num.is_empty() and cast('int', chunk_num.min()) < 0:
+            raise ValueError(f"BACKTEST strategy data column '{self.CHUNK_COL}' cannot contain negative values")
         return df
 
     def _create_metadata(self) -> PFundComponentDataMetadata:
         metadata = self._data_model.metadata
         if metadata is None:
-            raise ValueError("component metadata is required when writing an artifact")
+            raise ValueError('component metadata is required when writing an artifact')
         return metadata
+
+    def write_batch(self, df: pl.DataFrame) -> None:
+        """Writes the component's data.
+
+        A backtest reruns from scratch, so its data replaces the whole dataset,
+        including the chunks of a previous run that this run no longer has.
+        Data of other envs (e.g. LIVE) accumulates across sessions, so it is appended.
+        """
+        df = self._validate_schema(df)
+        metadata = self._create_metadata()
+        if self._requires_partitioning():
+            partitions: set[Partition] = {(chunk_num,) for chunk_num in df.get_column(self.CHUNK_COL).unique()}
+        else:
+            partitions = {()}
+        if self._data_model.env == Environment.BACKTEST:
+            # existing partitions not in df are written as empty partitions, i.e. their rows are deleted
+            _, existing = self._read()
+            self._write(df, {partition: metadata for partition in partitions | existing.keys()}, mode='replace')
+        else:
+            self._write(df, {partition: metadata for partition in partitions}, mode='append')
+
+    def read(self) -> tuple[pl.LazyFrame | None, dict[Partition, PFundComponentDataMetadata]]:
+        return self._read()

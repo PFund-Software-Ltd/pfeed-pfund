@@ -3,6 +3,8 @@ authors = ["softwareentrepreneer <softwareentrepreneer+pfeed-pfund@gmail.com>"]
 channels = ["conda-forge"]
 name = "pfeed-pfund"
 platforms = ["osx-arm64", "linux-aarch64", "linux-64", "win-64"]
+# NOTE: should match with setup-pixi in ci.yml
+requires-pixi = ">=0.83.0"
 # FIXME: set it back to "14 days" when the package is stable
 exclude-newer = "0d"
 

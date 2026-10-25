@@ -1,7 +1,7 @@
 [project]
 name = "pfeed-pfund"
 version = "0.0.1.dev1"
-description = "pfund as a data source plugin for pfeed"
+description = "pfund as a data source plugin for pfeed: component artifacts and engine states."
 readme = "README.md"
 authors = [
     { name = "softwareentrepreneer", email = "softwareentrepreneer+pfeed-pfund@gmail.com" }
@@ -12,8 +12,8 @@ dependencies = [
     "pfund>=0.0.25",
 ]
 
-[project.scripts]
-pfeed-pfund = "pfeed_pfund:main"
+[project.entry-points."pfeed.sources"]
+pfund = "pfeed_pfund:PFund"
 
 [tool.uv]
 # FIXME: set it back to "14 days" when the package is stable
@@ -23,3 +23,8 @@ exclude-newer-package = { uv_build = false, pfund-blocks = false, pfund-kit = fa
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.pytest]
+strict_markers = true
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]
